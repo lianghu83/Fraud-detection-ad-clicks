@@ -1,0 +1,182 @@
+---
+output:
+  word_document: default
+  html_document: default
+---
+Advertisement tracking fraud detection. 
+A semi-supervised learning problem. 
+Decision Tree and Random Forest.
+
+Load libraries.
+```{r}
+library(dplyr)
+library(pacman)
+library(data.table)
+library(e1071)
+library(ggplot2)
+library(DMwR)
+library(caret)
+library(randomForest)
+library(RWeka)
+library(pROC)
+```
+
+Read data. The train dataset given by Kaggle has about 185 million observations and 7 GB. This results in difficulty in manipulating data and building models in R. Therefore, we randomly select 1% of data with 1.85 million rows. We have saved the sampled dataset as SampleData.csv. The dataset is very clean without any missing value.
+```{r}
+AllData <- fread('train.csv', header = T, sep = ',')
+set.seed(583)
+SampleData <- sample_n(AllData, 1850000, replace = FALSE)
+write.csv(SampleData, file = "SampleData.csv",row.names=FALSE)
+rm(AllData)
+rm(SampleData)
+df <- read.csv("SampleData.csv")
+#check missing values
+colSums(is.na(df)) 
+```
+
+Convert click_time into 2 fields: wday (day of week) and hour (1-24). Then remove click_time and attributed_time since they are not used anymore.
+```{r}
+df$click_time <- as.POSIXct(df$click_time, 
+                            format="%Y-%m-%d %H:%M:%S",
+                            tz='UTC')
+#covert to China timezone.
+attributes(df$click_time)$tzone <- "Asia/Shanghai"
+#extract day of week and hour
+df$wday <- factor(weekdays(df$click_time))
+df$hour <- factor(hour(df$click_time))
+#remove unuseful timestamps
+df$attributed_time <- NULL
+df$click_time <- NULL
+```
+
+Check how many unique values in each field.
+```{r}
+apply(df, 2, function(x) length(unique(x)))
+```
+
+Create class to indicate whether clicks are fraud or not. We have found that the clicks by device (1,2,3032,3543,3866,59,5) are very suspicious. These devices have way more clicks than the other devices, but very few or even none of which lead to download. There devices are very likely used widely in making fraud clicks. However, there are some clicks with download for device (1,2). We believe these clicks come from normal users. There is a class imbalance problem (only 0.88% of classes are non-fraud clicks).
+```{r}
+df$class <- 'n' #non-fraud
+df$class[df$device %in% c(3032,3543,3866,59,5)] <- 'f' #fraud
+df$class[(df$device %in% c(1,2)) & (df$is_attributed==0)] <- 'f'
+df$class <- factor(df$class)
+table(df$class)
+```
+
+Add variables. We count the number of clicks associated with each attribute, and the rate of downloading apps. We also count the number of clicks by 2 fields and time, since fraud clicks likely occur continuously during a short time.  
+```{r}
+#add click count variables
+df %<>%
+  add_count(ip) %>% setnames("n", "n_ip") %>%
+  add_count(app) %>% setnames("n", "n_app") %>%
+  add_count(device) %>% setnames("n", "n_device") %>%
+  add_count(os) %>% setnames("n", "n_os") %>%
+  add_count(channel) %>% setnames("n", "n_channel")
+
+#add app download rate variables
+df %<>% 
+  group_by(ip) %>% 
+  mutate(r_ip=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(app) %>% 
+  mutate(r_app=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(device) %>% 
+  mutate(r_device=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(os) %>% 
+  mutate(r_os=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(channel) %>% 
+  mutate(r_channel=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup()
+
+#add click counts by two attributes and by hour
+df %<>%
+  add_count(device, ip, hour) %>% 
+  setnames("n", "n_device_ip_h") %>%
+  add_count(device, app, hour) %>% 
+  setnames("n", "n_device_app_h") %>%
+  add_count(device, os, hour) %>% 
+  setnames("n", "n_device_os_h") %>%
+  add_count(device, channel, hour) %>% 
+  setnames("n", "n_device_channel_h")
+
+#add app download rate variables
+df %<>% 
+  group_by(device, ip, hour) %>% 
+  mutate(r_device_ip_h=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(device, app, hour) %>% 
+  mutate(r_device_app_h=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(device, os, hour) %>% 
+  mutate(r_device_os_h=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup() %>%
+  group_by(device, channel, hour) %>%
+  mutate(r_device_channel_h=sum(is_attributed)/length(is_attributed)) %>% 
+  ungroup()
+```
+
+Split date into training and test datasets. We will use the independent test set to test models.
+```{r}
+set.seed(583)
+index <- createDataPartition(df$class, times=1, p=0.7, list=FALSE)
+train <- df[index, ]
+table(train$class)
+test <- df[-index, ]
+table(test$class)
+```
+
+To deal with the class imbalanced problem, we use down-sampling.
+```{r}
+#down-sampling
+train_down <- downSample(x=train[, -9],
+                         y=train$class)
+table(train_down$Class)
+```
+
+Build decision tree based on the down-sampled train data, and test the model using independent test dataset. By applying the decision tree model to the test dataset, 99.96% of clicks can be predicted correctly. No non-fraud click is predicted as fraud. Only 0.04% of fraud clicks are missed. 
+```{r decision tree}
+set.seed(583)
+ctrl_DT = trainControl(method="cv",
+                       number=10,
+                       savePred=T,
+                       classProbs=T,
+                       summaryFunction=twoClassSummary)
+model_DT <- train(Class~.,
+                  data=train_down,
+                  method='J48',
+                  trControl=ctrl_DT)
+model_DT
+plot(model_DT$finalModel)
+prediction_DT = predict(model_DT, test)
+confusionMatrix(prediction_DT, test$class)
+```
+
+Build random forest model. It spent 13.5 hours fitting the model.
+```{r random forest}
+#random forest
+ctrl = trainControl(method="cv",number=10,savePred=T,classProb=T)
+Grid_RF <- expand.grid(.mtry=c(1:15))
+folds = split(sample(nrow(df), nrow(df),replace=FALSE), as.factor(1:10))
+best.k = NULL
+train.accuracy.estimate = NULL
+fold.accuracy.estimate = NULL
+f=1
+for(f in 1:10){
+  trainingData = df[-folds[[f]],]
+  testData = df[folds[[f]],]
+  train_down <- downSample(x=trainingData[, -9],y=trainingData$class)
+  model_RF = train(Class~.,data=train_down, method="rf",trControl=ctrl,tuneGrid=Grid_RF)
+  best.k[f] = as.numeric(model_RF$bestTune)
+  train.accuracy.estimate[f] = as.numeric(model_RF$results[best.k[f],2])
+  fold.accuracy.estimate[f] = (table(predict(model_RF,testData),testData$class)[1,1]+table(predict(model_RF,testData),testData$class)[2,2])/length(testData$class)
+}
+mean(train.accuracy.estimate)
+mean(fold.accuracy.estimate)
+best.k
+```
+
+
+
